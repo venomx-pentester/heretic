@@ -106,26 +106,31 @@ def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
             )
         print()
 
-    strategy = prompt_select(
-        "How do you want to proceed?",
-        choices=[
-            Choice(
-                title="Merge LoRA into full model"
-                + (
-                    ""
-                    if not is_quantized
-                    else " (requires sufficient RAM)"
+        strategy = prompt_select(
+            "How do you want to proceed?",
+            choices=[
+                Choice(
+                    title="Merge LoRA into full model"
+                    + (
+                        ""
+                        if settings.quantization == QuantizationMethod.NONE
+                        else " (requires sufficient RAM)"
+                    ),
+                    value="merge",
                 ),
-                value="merge",
-            ),
-            Choice(
-                title="Save LoRA adapter only (can be merged later)",
-                value="adapter",
-            ),
-        ],
-    )
+                Choice(
+                    title="Cancel",
+                    value="cancel",
+                ),
+            ],
+        )
 
-    return strategy
+        if strategy == "cancel":
+            return None
+
+        return strategy
+    else:
+        return "merge"
 
 
 def run():
@@ -245,7 +250,7 @@ def run():
     except IndexError:
         existing_study = None
 
-    if existing_study is not None:
+    if existing_study is not None and settings.evaluate_model is None:
         choices = []
 
         if existing_study.user_attrs["finished"]:
@@ -760,8 +765,7 @@ def run():
                                 merged_model.save_pretrained(save_directory)
                                 del merged_model
                                 empty_cache()
-
-                            model.tokenizer.save_pretrained(save_directory)
+                                model.tokenizer.save_pretrained(save_directory)
 
                             print(f"Model saved to [bold]{save_directory}[/].")
 
@@ -818,18 +822,29 @@ def run():
                                 )
                                 del merged_model
                                 empty_cache()
+                                model.tokenizer.push_to_hub(
+                                    repo_id,
+                                    private=private,
+                                    token=token,
+                                )
 
-                            model.tokenizer.push_to_hub(
-                                repo_id,
-                                private=private,
-                                token=token,
-                            )
-
-                            # If the model path doesn't exist locally, it can be assumed
-                            # to be a model hosted on the Hugging Face Hub, in which case
+                            # If the model path exists locally and includes the
+                            # card, use it directly. If the model path doesn't
+                            # exist locally, it can be assumed to be a model
+                            # hosted on the Hugging Face Hub, in which case
                             # we can retrieve the model card.
-                            if not Path(settings.model).exists():
+                            model_path = Path(settings.model)
+                            if model_path.exists():
+                                card_path = (
+                                    model_path / huggingface_hub.constants.REPOCARD_NAME
+                                )
+                                if card_path.exists():
+                                    card = ModelCard.load(card_path)
+                                else:
+                                    card = None
+                            else:
                                 card = ModelCard.load(settings.model)
+                            if card is not None:
                                 if card.data is None:
                                     card.data = ModelCardData()
                                 if card.data.tags is None:
