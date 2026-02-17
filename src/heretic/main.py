@@ -757,12 +757,16 @@ def run():
                             else:
                                 print("Saving merged model...")
                                 merged_model = model.get_merged_model()
+                                # Clear weight conversions to avoid NotImplementedError
+                                # from revert_weight_conversion on models with ops
+                                # that don't implement reverse_op.
+                                merged_model._weight_conversions = None
                                 merged_model.save_pretrained(save_directory)
                                 del merged_model
                                 empty_cache()
                                 model.tokenizer.save_pretrained(save_directory)
 
-                            print(f"Model saved to [bold]{save_directory}[/].")
+                            print(f"[green]Model saved to [bold]{save_directory}[/].[/]")
 
                         case "Upload the model to Hugging Face":
                             # We don't use huggingface_hub.login() because that stores the token on disk,
@@ -810,6 +814,7 @@ def run():
                             else:
                                 print("Uploading merged model...")
                                 merged_model = model.get_merged_model()
+                                merged_model._weight_conversions = None
                                 merged_model.push_to_hub(
                                     repo_id,
                                     private=private,
@@ -892,7 +897,10 @@ def run():
                                     break
 
                 except Exception as error:
-                    print(f"[red]Error: {error}[/]")
+                    error_msg = str(error) or type(error).__name__
+                    print(f"[red]Error: {error_msg}[/]")
+                    import traceback
+                    traceback.print_exc()
 
 
 def main():
