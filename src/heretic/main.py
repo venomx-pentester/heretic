@@ -38,7 +38,7 @@ from rich.traceback import install
 from .analyzer import Analyzer
 from .config import QuantizationMethod, Settings
 from .evaluator import Evaluator
-from .model import AbliterationParameters, Model, _FP8_DTYPE_TOKEN, get_model_class
+from .model import AbliterationParameters, Model, get_model_class
 from .utils import (
     empty_cache,
     format_duration,
@@ -61,10 +61,7 @@ def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
     Returns "merge", "adapter", or None (if cancelled/invalid).
     """
 
-    is_quantized = (
-        settings.quantization == QuantizationMethod.BNB_4BIT
-        or model._loaded_dtype == _FP8_DTYPE_TOKEN
-    )
+    is_quantized = getattr(model.model.config, "quantization_config", None) is not None
 
     if is_quantized:
         print()
@@ -110,12 +107,7 @@ def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
             "How do you want to proceed?",
             choices=[
                 Choice(
-                    title="Merge LoRA into full model"
-                    + (
-                        ""
-                        if settings.quantization == QuantizationMethod.NONE
-                        else " (requires sufficient RAM)"
-                    ),
+                    title="Merge LoRA into full model (requires sufficient RAM)",
                     value="merge",
                 ),
                 Choice(

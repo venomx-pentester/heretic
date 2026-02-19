@@ -32,8 +32,6 @@ from transformers.generation import (
 from .config import QuantizationMethod, RowNormalization, Settings
 from .utils import Prompt, batchify, empty_cache, print
 
-_FP8_DTYPE_TOKEN = "fp8"
-
 
 def get_model_class(
     model: str,
@@ -87,7 +85,6 @@ class Model:
             if settings.max_memory
             else None
         )
-        self._loaded_dtype: str | None = None
         self.trusted_models = {settings.model: settings.trust_remote_code}
 
         if self.settings.evaluate_model is not None:
@@ -105,23 +102,13 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
-                load_kwargs = {
-                    "device_map": settings.device_map,
-                    "max_memory": self.max_memory,
-                    "trust_remote_code": self.trusted_models.get(settings.model),
-                    **extra_kwargs,
-                }
-                if dtype == _FP8_DTYPE_TOKEN:
-                    # FP8/NVFP4 pre-quantized models: don't pass dtype= (not a valid
-                    # PyTorch dtype). Use bfloat16 for compute and let HF auto-detect
-                    # the model's built-in quantization_config.
-                    load_kwargs["torch_dtype"] = torch.bfloat16
-                else:
-                    load_kwargs["dtype"] = dtype
-
                 self.model = get_model_class(settings.model).from_pretrained(
                     settings.model,
-                    **load_kwargs,
+                    dtype=dtype,
+                    device_map=settings.device_map,
+                    max_memory=self.max_memory,
+                    trust_remote_code=self.trusted_models.get(settings.model),
+                    **extra_kwargs,
                 )
 
                 # If we reach this point and the model requires trust_remote_code,
@@ -147,11 +134,7 @@ class Model:
                 print(f"[red]Failed[/] ({error})")
                 continue
 
-            self._loaded_dtype = dtype
-
-            if dtype == _FP8_DTYPE_TOKEN:
-                print("[green]Ok[/] (FP8/NVFP4 pre-quantized)")
-            elif settings.quantization == QuantizationMethod.BNB_4BIT:
+            if settings.quantization == QuantizationMethod.BNB_4BIT:
                 print("[green]Ok[/] (quantized to 4-bit precision)")
             else:
                 print("[green]Ok[/]")
@@ -223,7 +206,7 @@ class Model:
         """
         if self.settings.quantization == QuantizationMethod.BNB_4BIT:
             # BitsAndBytesConfig expects a torch.dtype, not a string.
-            if dtype == "auto" or dtype == _FP8_DTYPE_TOKEN:
+            if dtype == "auto":
                 compute_dtype = torch.bfloat16
             else:
                 compute_dtype = getattr(torch, dtype)
@@ -240,11 +223,10 @@ class Model:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
 
-        # Check if we need special handling for quantized models
-        if (
-            self.settings.quantization == QuantizationMethod.BNB_4BIT
-            or self._loaded_dtype == _FP8_DTYPE_TOKEN
-        ):
+        # Check if we need special handling for quantized models.
+        # This covers both on-the-fly quantization (e.g. BNB_4BIT) and pre-quantized
+        # models (e.g. FP8, MXFP4) — both set quantization_config on the model config.
+        if getattr(self.model.config, "quantization_config", None) is not None:
             # Quantized models need special handling - we must reload the base model
             # in full precision to merge the LoRA adapters
 
@@ -316,21 +298,13 @@ class Model:
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
-        load_kwargs = {
-            "device_map": self.settings.device_map,
-            "max_memory": self.max_memory,
-            "trust_remote_code": self.trusted_models.get(self.settings.model),
-            **extra_kwargs,
-        }
-        if self._loaded_dtype == _FP8_DTYPE_TOKEN:
-            # FP8/NVFP4 pre-quantized: use torch_dtype instead of dtype=.
-            load_kwargs["torch_dtype"] = torch.bfloat16
-        else:
-            load_kwargs["dtype"] = dtype
-
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
-            **load_kwargs,
+            dtype=dtype,
+            device_map=self.settings.device_map,
+            max_memory=self.max_memory,
+            trust_remote_code=self.trusted_models.get(self.settings.model),
+            **extra_kwargs,
         )
 
         self._apply_lora()
