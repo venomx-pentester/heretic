@@ -32,6 +32,8 @@ from transformers.generation import (
 from .config import QuantizationMethod, RowNormalization, Settings
 from .utils import Prompt, batchify, empty_cache, print
 
+_FP8_DTYPE_TOKEN = "fp8"
+
 
 def get_model_class(
     model: str,
@@ -61,6 +63,7 @@ class Model:
         self.settings = settings
         self.response_prefix = ""
         self.needs_reload = False
+        self._loaded_dtype: str | None = None
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
@@ -102,14 +105,27 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
-                self.model = get_model_class(settings.model).from_pretrained(
-                    settings.model,
-                    dtype=dtype,
-                    device_map=settings.device_map,
-                    max_memory=self.max_memory,
-                    trust_remote_code=self.trusted_models.get(settings.model),
-                    **extra_kwargs,
-                )
+                # FP8 pre-quantized models (e.g. NemotronH) reject the `dtype=`
+                # kwarg entirely. Use `torch_dtype=` instead and let HF
+                # auto-detect the quantization config from the model's config.json.
+                if dtype == _FP8_DTYPE_TOKEN:
+                    self.model = get_model_class(settings.model).from_pretrained(
+                        settings.model,
+                        torch_dtype=torch.bfloat16,
+                        device_map=settings.device_map,
+                        max_memory=self.max_memory,
+                        trust_remote_code=self.trusted_models.get(settings.model),
+                        **extra_kwargs,
+                    )
+                else:
+                    self.model = get_model_class(settings.model).from_pretrained(
+                        settings.model,
+                        dtype=dtype,
+                        device_map=settings.device_map,
+                        max_memory=self.max_memory,
+                        trust_remote_code=self.trusted_models.get(settings.model),
+                        **extra_kwargs,
+                    )
 
                 # If we reach this point and the model requires trust_remote_code,
                 # either the user accepted, or settings.trust_remote_code is True.
@@ -134,8 +150,12 @@ class Model:
                 print(f"[red]Failed[/] ({error})")
                 continue
 
+            self._loaded_dtype = dtype
+
             if settings.quantization == QuantizationMethod.BNB_4BIT:
                 print("[green]Ok[/] (quantized to 4-bit precision)")
+            elif dtype == _FP8_DTYPE_TOKEN:
+                print("[green]Ok[/] (FP8/NVFP4 pre-quantized)")
             else:
                 print("[green]Ok[/]")
 
@@ -151,10 +171,14 @@ class Model:
 
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
         print("* Abliterable components:")
-        for component, modules in self.get_layer_modules(0).items():
-            print(
-                f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
+        components = self.get_abliterable_components()
+        for component in components:
+            layer_count = sum(
+                1
+                for i in range(len(self.get_layers()))
+                if component in self.get_layer_modules(i)
             )
+            print(f"  * [bold]{component}[/]: present in [bold]{layer_count}[/] layers")
 
     def _apply_lora(self):
         # Guard against calling this method at the wrong time.
@@ -206,7 +230,7 @@ class Model:
         """
         if self.settings.quantization == QuantizationMethod.BNB_4BIT:
             # BitsAndBytesConfig expects a torch.dtype, not a string.
-            if dtype == "auto":
+            if dtype in ("auto", _FP8_DTYPE_TOKEN):
                 compute_dtype = torch.bfloat16
             else:
                 compute_dtype = getattr(torch, dtype)
@@ -223,8 +247,13 @@ class Model:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
 
-        # Check if we need special handling for quantized models
-        if self.settings.quantization == QuantizationMethod.BNB_4BIT:
+        # Check if we need special handling for quantized models.
+        # This covers both on-the-fly quantization (BNB_4BIT) and pre-quantized
+        # models (FP8, NVFP4) — both set quantization_config on the model config.
+        if (
+            getattr(self.model.config, "quantization_config", None) is not None
+            or self._loaded_dtype == _FP8_DTYPE_TOKEN
+        ):
             # Quantized models need special handling - we must reload the base model
             # in full precision to merge the LoRA adapters
 
@@ -296,14 +325,24 @@ class Model:
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
-        self.model = get_model_class(self.settings.model).from_pretrained(
-            self.settings.model,
-            dtype=dtype,
-            device_map=self.settings.device_map,
-            max_memory=self.max_memory,
-            trust_remote_code=self.trusted_models.get(self.settings.model),
-            **extra_kwargs,
-        )
+        if self._loaded_dtype == _FP8_DTYPE_TOKEN:
+            self.model = get_model_class(self.settings.model).from_pretrained(
+                self.settings.model,
+                torch_dtype=torch.bfloat16,
+                device_map=self.settings.device_map,
+                max_memory=self.max_memory,
+                trust_remote_code=self.trusted_models.get(self.settings.model),
+                **extra_kwargs,
+            )
+        else:
+            self.model = get_model_class(self.settings.model).from_pretrained(
+                self.settings.model,
+                dtype=dtype,
+                device_map=self.settings.device_map,
+                max_memory=self.max_memory,
+                trust_remote_code=self.trusted_models.get(self.settings.model),
+                **extra_kwargs,
+            )
 
         self._apply_lora()
 
@@ -319,6 +358,10 @@ class Model:
         # Most multimodal models.
         with suppress(Exception):
             return model.model.language_model.layers
+
+        # NemotronH and other backbone-based models.
+        with suppress(Exception):
+            return model.backbone.layers
 
         # Text-only models.
         return model.model.layers
@@ -340,9 +383,10 @@ class Model:
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # Exceptions aren't suppressed here, because there is currently
-        # no alternative location for the attention out-projection.
-        try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
+        # Standard attention out-projection. Suppressed because NemotronH layers
+        # use mixer.o_proj instead — they have no self_attn attribute.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Most dense models.
         with suppress(Exception):
@@ -367,14 +411,40 @@ class Model:
             for expert in layer.moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.output_linear)  # ty:ignore[possibly-missing-attribute]
 
-        # We need at least one module across all components for abliteration to work.
-        total_modules = sum(len(mods) for mods in modules.values())
-        assert total_modules > 0, "No abliterable modules found in layer"
+        # NemotronH hybrid layers — all use a unified `mixer` attribute.
+        # Attention layers have mixer.o_proj.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.mixer.o_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # NemotronH simple MLP layers have mixer.down_proj.
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.mixer.down_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # NemotronH MoE per-expert down_proj.
+        with suppress(Exception):
+            for expert in layer.mixer.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
+                try_add("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # NemotronH MoE shared expert.
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.mixer.shared_experts.down_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # NemotronH Mamba2 SSM layers have mixer.out_proj.
+        with suppress(Exception):
+            try_add("mamba.out_proj", layer.mixer.out_proj)  # ty:ignore[possibly-missing-attribute]
 
         return modules
 
     def get_abliterable_components(self) -> list[str]:
-        return list(self.get_layer_modules(0).keys())
+        # Scan all layers to collect the union of component types.
+        # Required for hybrid architectures (e.g. NemotronH) where different
+        # layer types expose different abliterable modules.
+        all_components: dict[str, bool] = {}
+        for i in range(len(self.get_layers())):
+            for component in self.get_layer_modules(i):
+                all_components[component] = True
+        assert len(all_components) > 0, "No abliterable modules found in any layer"
+        return list(all_components.keys())
 
     def abliterate(
         self,
@@ -448,6 +518,12 @@ class Model:
                     #        module wrapped by the LoRA adapter has a weight attribute.
                     #        See the comment above for why this is currently not guaranteed.
                     base_weight = cast(Tensor, module.base_layer.weight)
+
+                    # Skip modules on meta device (CPU-offloaded by accelerate)
+                    # or with corrupt weights — their LoRA stays at zero (identity).
+                    if base_weight.device.type == "meta" or torch.isnan(base_weight.to(torch.float32)[:1]).any():
+                        continue
+
                     quant_state = getattr(base_weight, "quant_state", None)
 
                     if quant_state is None:
@@ -518,6 +594,41 @@ class Model:
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
                     weight_A.data = lora_A.to(weight_A.dtype)
                     weight_B.data = lora_B.to(weight_B.dtype)
+
+    def _get_hidden_states_via_hooks(self, inputs: BatchEncoding) -> list[Tensor]:
+        """Capture per-layer hidden states via forward hooks.
+
+        Fallback for models (e.g. NemotronH) that return None hidden_states
+        from generate() even with output_hidden_states=True.
+        Returns a list matching the standard format: [embedding, layer_0, ..., layer_N].
+        """
+        captured: list[Tensor] = []
+        embedding_output: list[Tensor] = []
+
+        def make_hook(idx: int):
+            def hook(module: Module, args: Any, output: Any) -> None:
+                tensor = output[0] if isinstance(output, tuple) else output
+                captured.append(tensor.detach())
+            return hook
+
+        def embedding_hook(module: Module, args: Any) -> None:
+            # Pre-hooks receive (module, args) — no output argument.
+            if isinstance(args, tuple) and len(args) > 0 and isinstance(args[0], Tensor):
+                embedding_output.append(args[0].detach())
+
+        layers = self.get_layers()
+        handles = [layers[0].register_forward_pre_hook(embedding_hook)]
+        for layer in layers:
+            handles.append(layer.register_forward_hook(make_hook(len(handles) - 1)))
+
+        try:
+            self.model(**inputs)
+        finally:
+            for h in handles:
+                h.remove()
+
+        result = (embedding_output[:1] if embedding_output else []) + captured
+        return result
 
     def generate(
         self,
@@ -603,7 +714,7 @@ class Model:
     def get_residuals(self, prompts: list[Prompt]) -> Tensor:
         # We only generate one token, and we return the residual vectors
         # at that token position, for each prompt and layer.
-        _, outputs = self.generate(
+        inputs, outputs = self.generate(
             prompts,
             max_new_tokens=1,
             output_hidden_states=True,
@@ -614,16 +725,31 @@ class Model:
         # of model.generate with return_dict_in_generate=True.
         outputs = cast(GenerateDecoderOnlyOutput, outputs)
 
-        # Hidden states for the first (only) generated token.
-        # This cast is valid because we passed output_hidden_states=True above.
-        hidden_states = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
+        # NemotronH returns a tuple of Nones for hidden_states even with
+        # output_hidden_states=True. Fall back to forward hooks in that case.
+        has_hidden_states = (
+            outputs.hidden_states is not None
+            and len(outputs.hidden_states) > 0
+            and outputs.hidden_states[0] is not None  # ty:ignore[non-subscriptable]
+        )
+
+        if has_hidden_states:
+            # Hidden states for the first (only) generated token.
+            # This cast is valid because we passed output_hidden_states=True above.
+            hidden_states_raw = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
+            # Move all tensors to the same device (required for multi-GPU).
+            target_device = hidden_states_raw[0].device
+            hidden_states_list: list[Tensor] = [
+                t[:, -1, :].to(target_device) for t in hidden_states_raw
+            ]
+        else:
+            hook_states = self._get_hidden_states_via_hooks(inputs)
+            target_device = hook_states[0].device
+            hidden_states_list = [t[:, -1, :].to(target_device) for t in hook_states]
 
         # The returned tensor has shape (prompt, layer, component).
         residuals = torch.stack(
-            # layer_hidden_states has shape (prompt, position, component),
-            # so this extracts the hidden states at the end of each prompt,
-            # and stacks them up over the layers.
-            [layer_hidden_states[:, -1, :] for layer_hidden_states in hidden_states],
+            hidden_states_list,
             dim=1,
         )
 

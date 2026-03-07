@@ -17,6 +17,7 @@ from pydantic_settings import (
 class QuantizationMethod(str, Enum):
     NONE = "none"
     BNB_4BIT = "bnb_4bit"
+    FP8 = "fp8"
 
 
 class RowNormalization(str, Enum):
