@@ -521,7 +521,10 @@ class Model:
 
                     # Skip modules on meta device (CPU-offloaded by accelerate)
                     # or with corrupt weights — their LoRA stays at zero (identity).
-                    if base_weight.device.type == "meta" or torch.isnan(base_weight.to(torch.float32)[:1]).any():
+                    if (
+                        base_weight.device.type == "meta"
+                        or torch.isnan(base_weight.to(torch.float32)[:1]).any()
+                    ):
                         continue
 
                     quant_state = getattr(base_weight, "quant_state", None)
@@ -609,11 +612,16 @@ class Model:
             def hook(module: Module, args: Any, output: Any) -> None:
                 tensor = output[0] if isinstance(output, tuple) else output
                 captured.append(tensor.detach())
+
             return hook
 
         def embedding_hook(module: Module, args: Any) -> None:
             # Pre-hooks receive (module, args) — no output argument.
-            if isinstance(args, tuple) and len(args) > 0 and isinstance(args[0], Tensor):
+            if (
+                isinstance(args, tuple)
+                and len(args) > 0
+                and isinstance(args[0], Tensor)
+            ):
                 embedding_output.append(args[0].detach())
 
         layers = self.get_layers()
@@ -736,7 +744,9 @@ class Model:
         if has_hidden_states:
             # Hidden states for the first (only) generated token.
             # This cast is valid because we passed output_hidden_states=True above.
-            hidden_states_raw = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
+            hidden_states_raw = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[
+                0
+            ]
             # Move all tensors to the same device (required for multi-GPU).
             target_device = hidden_states_raw[0].device
             hidden_states_list: list[Tensor] = [
