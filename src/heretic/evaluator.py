@@ -111,7 +111,9 @@ class Evaluator:
         kl_divergence_target = self.settings.kl_divergence_target
 
         refusals_score = (
-            refusals / self.base_refusals if self.base_refusals > 0 else float(refusals)
+            refusals / self.base_refusals
+            if self.base_refusals > 0
+            else min(float(refusals) / max(len(self.bad_prompts), 1), 1.0)
         )
 
         if kl_divergence >= kl_divergence_target:

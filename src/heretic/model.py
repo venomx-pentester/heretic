@@ -620,7 +620,12 @@ class Model:
 
         # NemotronH Mamba2 SSM — state transition log-parameter (per-head retention).
         # A_log is nn.Parameter of shape (nheads,), not an nn.Linear — LoRA cannot wrap it.
-        # TODO: add a direct-parameter abliteration path to support A_log targeting.
+        # More fundamentally, A_log lives in (num_heads,) space while the refusal direction
+        # lives in (hidden_size,) space — standard direction-projection cannot apply here.
+        # Targeting A_log would require a different approach (e.g. activation-based scaling).
+        #
+        # Similarly, conv1d is nn.Conv1d with shape (conv_dim, 1, kernel_size) operating
+        # in a different space than the residual stream — not amenable to direction projection.
 
         return modules
 
@@ -628,8 +633,30 @@ class Model:
         # Scan all layers because hybrid models (e.g. NemotronH, Qwen3.5 MoE) have different
         # components on different layers.
         components: set[str] = set()
-        for layer_index in range(len(self.get_layers())):
-            components.update(self.get_layer_modules(layer_index).keys())
+        n_layers = len(self.get_layers())
+        empty_layers: list[int] = []
+        for layer_index in range(n_layers):
+            layer_modules = self.get_layer_modules(layer_index)
+            if layer_modules:
+                components.update(layer_modules.keys())
+            else:
+                empty_layers.append(layer_index)
+
+        if empty_layers:
+            sample_idx = empty_layers[0]
+            sample_layer = self.get_layers()[sample_idx]
+            child_names = [name for name, _ in sample_layer.named_children()]
+            print(
+                f"  [yellow]Warning: {len(empty_layers)}/{n_layers} layers have "
+                f"no recognized abliterable modules (e.g. layer {sample_idx}: "
+                f"{type(sample_layer).__name__} with children: {child_names})[/]"
+            )
+
+        assert len(components) > 0, (
+            "No abliterable modules found in any layer. "
+            "This model architecture may not be supported."
+        )
+
         return sorted(components)
 
     def abliterate(
@@ -690,6 +717,19 @@ class Model:
                     #        module types depending on the chosen quantization.
                     module = cast(Linear, module)
 
+                    # Get the base weight early so we can skip meta-device modules
+                    # before doing any expensive computation.
+                    #
+                    # FIXME: This cast is valid only under the assumption that the original
+                    #        module wrapped by the LoRA adapter has a weight attribute.
+                    #        See the comment above for why this is currently not guaranteed.
+                    base_weight = cast(Tensor, module.base_layer.weight)
+
+                    # Skip modules on meta device (no actual data — e.g. offloaded
+                    # modules that don't fit in VRAM).
+                    if base_weight.device.type == "meta":
+                        continue
+
                     # LoRA abliteration: delta W = -lambda * v * (v^T W)
                     # lora_B = -lambda * v
                     # lora_A = v^T W
@@ -698,12 +738,6 @@ class Model:
                     # and move to the correct device.
                     v = layer_refusal_direction.to(module.weight.device)
 
-                    # Get W (dequantize if necessary).
-                    #
-                    # FIXME: This cast is valid only under the assumption that the original
-                    #        module wrapped by the LoRA adapter has a weight attribute.
-                    #        See the comment above for why this is currently not guaranteed.
-                    base_weight = cast(Tensor, module.base_layer.weight)
                     quant_state = getattr(base_weight, "quant_state", None)
 
                     if quant_state is None:
@@ -779,9 +813,9 @@ class Model:
                         lora_B = U @ torch.diag(sqrt_S)
                         lora_A = torch.diag(sqrt_S) @ Vh
 
-                    # Skip modules whose base weight is on meta device (no actual data)
-                    # or contains NaN values (corrupted or incompletely loaded weights).
-                    if base_weight.device.type == "meta" or torch.isnan(W).any():
+                    # Skip modules with NaN weights (corrupted or incompletely loaded).
+                    # Meta device check is handled earlier, before expensive computation.
+                    if torch.isnan(W).any():
                         continue
 
                     # Assign to adapters. The adapter name is "default", because that's
