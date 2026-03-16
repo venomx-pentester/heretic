@@ -598,6 +598,16 @@ class Model:
         with suppress(Exception):
             try_add("mamba.out_proj", layer.mixer.out_proj)  # ty:ignore[possibly-missing-attribute]
 
+        # NemotronH Mamba2 SSM — input projection (gates what enters the SSM state).
+        # in_proj maps hidden_size → (2·intermediate_size + 2·ssm_state_size + num_heads).
+        # Because out_features ≠ hidden_size, abliterate() uses input-side projection.
+        with suppress(Exception):
+            try_add("mamba.in_proj", layer.mixer.in_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # NemotronH Mamba2 SSM — state transition log-parameter (per-head retention).
+        # A_log is nn.Parameter of shape (nheads,), not an nn.Linear — LoRA cannot wrap it.
+        # TODO: add a direct-parameter abliteration path to support A_log targeting.
+
         return modules
 
     def get_abliterable_components(self) -> list[str]:
@@ -734,14 +744,22 @@ class Model:
                         # Normalize the weight matrix along the rows.
                         W = F.normalize(W, p=2, dim=1)
 
-                    # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
-                    lora_A = (v @ W).view(1, -1)
-
-                    # Calculate lora_B = -weight * v
-                    # v is (d_out,)
-                    lora_B = (-weight * v).view(-1, 1)
+                    if v.shape[0] == W.shape[0]:
+                        # Output-side abliteration (standard): ΔW = -λ (v v^T) W
+                        # v is in the output space (hidden_size). Used for out_proj,
+                        # down_proj, o_proj — all modules that project INTO the residual stream.
+                        # v is (d_out,), W is (d_out, d_in)
+                        lora_A = (v @ W).view(1, -1)  # (1, d_in)
+                        lora_B = (-weight * v).view(-1, 1)  # (d_out, 1)
+                    else:
+                        # Input-side abliteration: ΔW = -λ W (v v^T)
+                        # v is in the input space (hidden_size) but d_out ≠ hidden_size.
+                        # Used for mamba.in_proj: input is the residual stream (hidden_size)
+                        # but output expands into SSM parameter space (in_proj_size).
+                        # Removes the refusal direction from the input columns of W.
+                        # v is (d_in,), W is (d_out, d_in)
+                        lora_A = v.view(1, -1)  # (1, d_in)
+                        lora_B = (-(W @ v) * weight).view(-1, 1)  # (d_out, 1)
 
                     if self.settings.row_normalization == RowNormalization.PRE:
                         # Make the LoRA adapter apply to the original weight matrix.
