@@ -758,6 +758,10 @@ class Model:
                         # but output expands into SSM parameter space (in_proj_size).
                         # Removes the refusal direction from the input columns of W.
                         # v is (d_in,), W is (d_out, d_in)
+                        assert v.shape[0] == W.shape[1], (
+                            f"Refusal direction dim {v.shape[0]} matches neither "
+                            f"out_features {W.shape[0]} nor in_features {W.shape[1]}"
+                        )
                         lora_A = v.view(1, -1)  # (1, d_in)
                         lora_B = (-(W @ v) * weight).view(-1, 1)  # (d_out, 1)
 
