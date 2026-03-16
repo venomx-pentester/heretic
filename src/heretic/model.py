@@ -316,18 +316,17 @@ class Model:
 
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
         print("* Abliterable components:")
-        components = self.get_abliterable_components()
-        for component in components:
-            # Count how many layers contain this component.
-            layer_count = sum(
-                1
-                for i in range(len(self.get_layers()))
-                if component in self.get_layer_modules(i)
-            )
-            print(f"  * [bold]{component}[/]: present in [bold]{layer_count}[/] layers")
+        all_components = {}
+        for layer_index in range(len(self.get_layers())):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                if component not in all_components:
+                    all_components[component] = 0
+                all_components[component] += len(modules)
+        for component, count in all_components.items():
+            print(f"  * [bold]{component}[/]: [bold]{count}[/] modules total")
 
         # If the model has Mamba/SSM layers, suggest installing the fast kernels.
-        if any(c.startswith("mamba.") for c in components):
+        if any(c.startswith("mamba.") for c in all_components):
             try:
                 import causal_conv1d  # ty:ignore[unresolved-import]  # noqa: F401
                 import mamba_ssm  # ty:ignore[unresolved-import]  # noqa: F401
@@ -348,14 +347,24 @@ class Model:
         assert isinstance(self.model, PreTrainedModel)
 
         # Always use LoRA adapters for abliteration (faster reload, no weight modification).
-        # We use the leaf names (e.g. "o_proj") as target modules.
-        # This may cause LoRA adapters to be attached to unrelated modules (e.g. "conv.o_proj"),
-        # but this is harmless as we only abliterate the modules we target in `abliterate()`,
-        # leaving the others at their default (identity) state.
-        # NOTE: This will need to be updated when hybrid layer support (#43) is merged.
-        target_modules = [
-            comp.split(".")[-1] for comp in self.get_abliterable_components()
-        ]
+        # Collect actual leaf module names from the model for LoRA targeting.
+        # This is more robust than splitting component keys (e.g. "attn.o_proj" -> "o_proj")
+        # because hybrid models like Qwen3.5 MoE have modules with different names
+        # across layers (e.g. "o_proj" on attention layers, "out_proj" on linear attention layers).
+        target_modules_set: set[str] = set()
+
+        for layer_index, layer in enumerate(self.get_layers()):
+            module_id_to_leaf_name = {
+                id(module): module_name.split(".")[-1]
+                for module_name, module in layer.named_modules()
+            }
+
+            for modules in self.get_layer_modules(layer_index).values():
+                for module in modules:
+                    if id(module) in module_id_to_leaf_name:
+                        target_modules_set.add(module_id_to_leaf_name[id(module)])
+
+        target_modules = list(target_modules_set)
 
         if self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -548,9 +557,14 @@ class Model:
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # Standard transformer attention out-projection.
+        # Standard self-attention out-projection (most models).
         with suppress(Exception):
             try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead
+        # of standard self-attention, so self_attn.o_proj doesn't exist on those layers.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Most dense models.
         with suppress(Exception):
@@ -611,39 +625,12 @@ class Model:
         return modules
 
     def get_abliterable_components(self) -> list[str]:
-        # Scan all layers to collect the union of component types.
-        # This is necessary for hybrid architectures (e.g. NemotronH) where
-        # different layers have different component types.
-        all_components: dict[str, list[Module]] = {}
-        n_layers = len(self.get_layers())
-        skipped_layers: list[int] = []
-        for layer_index in range(n_layers):
-            layer_modules = self.get_layer_modules(layer_index)
-            if not layer_modules:
-                skipped_layers.append(layer_index)
-                continue
-            for component, modules in layer_modules.items():
-                if component not in all_components:
-                    all_components[component] = modules
-
-        if skipped_layers:
-            # Log which layers were skipped and what their structure looks like
-            # so users can report the architecture for future support.
-            sample_idx = skipped_layers[0]
-            sample_layer = self.get_layers()[sample_idx]
-            child_names = [name for name, _ in sample_layer.named_children()]
-            print(
-                f"  [yellow]Warning: {len(skipped_layers)}/{n_layers} layers have "
-                f"no recognized abliterable modules (e.g. layer {sample_idx}: "
-                f"{type(sample_layer).__name__} with children: {child_names})[/]"
-            )
-
-        assert len(all_components) > 0, (
-            "No abliterable modules found in any layer. "
-            "This model architecture may not be supported."
-        )
-
-        return list(all_components.keys())
+        # Scan all layers because hybrid models (e.g. NemotronH, Qwen3.5 MoE) have different
+        # components on different layers.
+        components: set[str] = set()
+        for layer_index in range(len(self.get_layers())):
+            components.update(self.get_layer_modules(layer_index).keys())
+        return sorted(components)
 
     def abliterate(
         self,
@@ -1093,7 +1080,12 @@ class Model:
             max_new_tokens=4096,
         )  # ty:ignore[call-non-callable]
 
-        return self.tokenizer.decode(
-            outputs[0, inputs["input_ids"].shape[1] :],
-            skip_special_tokens=True,
+        # This cast is valid because str is the return type
+        # when passing a sequence of token IDs.
+        return cast(
+            str,
+            self.tokenizer.decode(
+                outputs[0, inputs["input_ids"].shape[1] :],
+                skip_special_tokens=True,
+            ),
         )
