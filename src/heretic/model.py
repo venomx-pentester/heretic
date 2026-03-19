@@ -415,6 +415,20 @@ class Model:
             )
         return None
 
+    @staticmethod
+    def _fix_tied_weights_keys(model: PreTrainedModel) -> None:
+        """Workaround for transformers 5.x API change.
+
+        Transformers 5.x changed _tied_weights_keys from list[str] to dict[str, str].
+        Some model codes (e.g. NemotronH) still use the old list format, which crashes
+        save_pretrained() when it calls .keys() on the attribute. Neutralize it here
+        since these models typically don't tie weights anyway.
+        """
+        for module in model.modules():
+            twk = getattr(module, "_tied_weights_keys", None)
+            if isinstance(twk, list):
+                module._tied_weights_keys = None
+
     def get_merged_model(self) -> PreTrainedModel:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
@@ -458,6 +472,7 @@ class Model:
             # Merge and unload
             print("* Merging LoRA adapters into base model...")
             merged_model = peft_model.merge_and_unload()
+            self._fix_tied_weights_keys(merged_model)
             return merged_model
         else:
             # Non-quantized model - can merge directly
@@ -466,6 +481,7 @@ class Model:
             # merge_and_unload() modifies self.model in-place, destroying LoRA adapters.
             # Mark for full reload if user switches trials later.
             self.needs_reload = True
+            self._fix_tied_weights_keys(merged_model)
             return merged_model
 
     def reset_model(self):
