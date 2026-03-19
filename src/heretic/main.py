@@ -922,6 +922,8 @@ def run():
                                     break
 
                 except Exception as error:
+                    import traceback
+                    traceback.print_exc()
                     print(f"[red]Error: {error}[/]")
 
 
